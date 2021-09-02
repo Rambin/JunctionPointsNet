@@ -69,6 +69,7 @@ namespace Monitor.Core.Utilities
             GenericWrite = 0x40000000,
             GenericExecute = 0x20000000,
             GenericAll = 0x10000000,
+            GenericNone = 0x0,
         }
 
         [Flags]
@@ -175,15 +176,15 @@ namespace Monitor.Core.Utilities
             IntPtr OutBuffer, int nOutBufferSize,
             out int pBytesReturned, IntPtr lpOverlapped);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr CreateFile(
-            string lpFileName,
-            EFileAccess dwDesiredAccess,
-            EFileShare dwShareMode,
-            IntPtr lpSecurityAttributes,
-            ECreationDisposition dwCreationDisposition,
-            EFileAttributes dwFlagsAndAttributes,
-            IntPtr hTemplateFile);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateFileW(
+             [MarshalAs(UnmanagedType.LPWStr)] string filename,
+             [MarshalAs(UnmanagedType.U4)] EFileAccess access,
+             [MarshalAs(UnmanagedType.U4)] EFileShare share,
+             IntPtr securityAttributes,
+             [MarshalAs(UnmanagedType.U4)] ECreationDisposition creationDisposition,
+             [MarshalAs(UnmanagedType.U4)] EFileAttributes flagsAndAttributes,
+             IntPtr templateFile);
 
         /// <summary>
         /// Creates a junction point from the specified directory to the specified target directory.
@@ -215,18 +216,24 @@ namespace Monitor.Core.Utilities
 
             using (SafeFileHandle handle = OpenReparsePoint(junctionPoint, EFileAccess.GenericWrite))
             {
-                byte[] targetDirBytes = Encoding.Unicode.GetBytes(NonInterpretedPathPrefix + Path.GetFullPath(targetDir));
+                byte[] printNameBytes = Encoding.Unicode.GetBytes(targetDir);
+                if (targetDir.StartsWith(NonInterpretedPathPrefix) || targetDir.StartsWith(@"\\?\"))
+                {
+                    targetDir = targetDir.Substring(4);
+                }
+                byte[] targetDirBytes = Encoding.Unicode.GetBytes(NonInterpretedPathPrefix + targetDir);
 
                 REPARSE_DATA_BUFFER reparseDataBuffer = new REPARSE_DATA_BUFFER();
 
                 reparseDataBuffer.ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
-                reparseDataBuffer.ReparseDataLength = (ushort)(targetDirBytes.Length + 12);
+                reparseDataBuffer.ReparseDataLength = (ushort)(targetDirBytes.Length + printNameBytes.Length + 12);
                 reparseDataBuffer.SubstituteNameOffset = 0;
                 reparseDataBuffer.SubstituteNameLength = (ushort)targetDirBytes.Length;
                 reparseDataBuffer.PrintNameOffset = (ushort)(targetDirBytes.Length + 2);
-                reparseDataBuffer.PrintNameLength = 0;
+                reparseDataBuffer.PrintNameLength = (ushort)printNameBytes.Length;
                 reparseDataBuffer.PathBuffer = new byte[0x3ff0];
                 Array.Copy(targetDirBytes, reparseDataBuffer.PathBuffer, targetDirBytes.Length);
+                Array.Copy(printNameBytes, 0, reparseDataBuffer.PathBuffer, reparseDataBuffer.PrintNameOffset, printNameBytes.Length);
 
                 int inBufferSize = Marshal.SizeOf(reparseDataBuffer);
                 IntPtr inBuffer = Marshal.AllocHGlobal(inBufferSize);
@@ -237,7 +244,7 @@ namespace Monitor.Core.Utilities
 
                     int bytesReturned;
                     bool result = DeviceIoControl(handle.DangerousGetHandle(), FSCTL_SET_REPARSE_POINT,
-                        inBuffer, targetDirBytes.Length + 20, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
+                        inBuffer, targetDirBytes.Length + printNameBytes.Length + 20, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
 
                     if (!result)
                         ThrowLastWin32Error("Unable to create junction point.");
@@ -316,7 +323,7 @@ namespace Monitor.Core.Utilities
             if (! Directory.Exists(path))
                 return false;
 
-            using (SafeFileHandle handle = OpenReparsePoint(path, EFileAccess.GenericRead))
+            using (SafeFileHandle handle = OpenReparsePoint(path, EFileAccess.GenericNone))
             {
                 string target = InternalGetTarget(handle);
                 return target != null;
@@ -335,7 +342,7 @@ namespace Monitor.Core.Utilities
         /// exist, is invalid, is not a junction point, or some other error occurs</exception>
         public static string GetTarget(string junctionPoint)
         {
-            using (SafeFileHandle handle = OpenReparsePoint(junctionPoint, EFileAccess.GenericRead))
+            using (SafeFileHandle handle = OpenReparsePoint(junctionPoint, EFileAccess.GenericNone))
             {
                 string target = InternalGetTarget(handle);
                 if (target == null)
@@ -374,6 +381,12 @@ namespace Monitor.Core.Utilities
                 string targetDir = Encoding.Unicode.GetString(reparseDataBuffer.PathBuffer,
                     reparseDataBuffer.SubstituteNameOffset, reparseDataBuffer.SubstituteNameLength);
 
+                if (reparseDataBuffer.PrintNameLength > 0)
+                {
+                    targetDir = Encoding.Unicode.GetString(reparseDataBuffer.PathBuffer,
+                    reparseDataBuffer.PrintNameOffset, reparseDataBuffer.PrintNameLength);
+                }
+
                 if (targetDir.StartsWith(NonInterpretedPathPrefix))
                     targetDir = targetDir.Substring(NonInterpretedPathPrefix.Length);
 
@@ -387,7 +400,7 @@ namespace Monitor.Core.Utilities
 
         private static SafeFileHandle OpenReparsePoint(string reparsePoint, EFileAccess accessMode)
         {
-            SafeFileHandle reparsePointHandle = new SafeFileHandle(CreateFile(reparsePoint, accessMode,
+            SafeFileHandle reparsePointHandle = new SafeFileHandle(CreateFileW(reparsePoint, accessMode,
                 EFileShare.Read | EFileShare.Write | EFileShare.Delete,
                 IntPtr.Zero, ECreationDisposition.OpenExisting,
                 EFileAttributes.BackupSemantics | EFileAttributes.OpenReparsePoint, IntPtr.Zero), true);
